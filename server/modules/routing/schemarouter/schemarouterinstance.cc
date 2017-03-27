@@ -40,131 +40,17 @@ using std::map;
  * @file schemarouter.c The entry points for the simple sharding router module.
  */
 
-SchemaRouter::SchemaRouter(SERVICE *service, char **options):
+SchemaRouter::SchemaRouter(SERVICE *service, Config& config):
     mxs::Router<SchemaRouter, SchemaRouterSession>(service),
+    m_config(config),
     m_service(service)
 {
-    MXS_CONFIG_PARAMETER* conf;
-    MXS_CONFIG_PARAMETER* param;
-
     /** Add default system databases to ignore */
     m_ignored_dbs.insert("mysql");
     m_ignored_dbs.insert("information_schema");
     m_ignored_dbs.insert("performance_schema");
 
-    m_stats.longest_sescmd = 0;
-    m_stats.n_hist_exceeded = 0;
-    m_stats.n_queries = 0;
-    m_stats.n_sescmd = 0;
-    m_stats.ses_longest = 0;
-    m_stats.ses_shortest = (double)((unsigned long)(~0));
     spinlock_init(&m_lock);
-
-    conf = service->svc_config_param;
-
-    m_config.refresh_databases = config_get_bool(conf, "refresh_databases");
-    m_config.refresh_min_interval = config_get_integer(conf, "refresh_interval");
-    m_config.debug = config_get_bool(conf, "debug");
-
-    if ((config_get_param(conf, "auth_all_servers")) == NULL)
-    {
-        MXS_NOTICE("Authentication data is fetched from all servers. To disable this "
-                   "add 'auth_all_servers=0' to the service.");
-        service->users_from_all = true;
-    }
-
-    if ((param = config_get_param(conf, "ignore_databases_regex")))
-    {
-        int errcode;
-        PCRE2_SIZE erroffset;
-        pcre2_code* re = pcre2_compile((PCRE2_SPTR)param->value, PCRE2_ZERO_TERMINATED, 0,
-                                       &errcode, &erroffset, NULL);
-
-        if (re == NULL)
-        {
-            PCRE2_UCHAR errbuf[512];
-            pcre2_get_error_message(errcode, errbuf, sizeof(errbuf));
-            MXS_ERROR("Regex compilation failed at %d for regex '%s': %s",
-                      (int)erroffset, param->value, errbuf);
-            throw std::runtime_error("Regex compilation failed");
-        }
-
-        pcre2_match_data* match_data = pcre2_match_data_create_from_pattern(re, NULL);
-
-        if (match_data == NULL)
-        {
-            pcre2_code_free(re);
-            throw std::bad_alloc();
-        }
-
-        m_ignore_regex = re;
-        m_ignore_match_data = match_data;
-    }
-
-    if ((param = config_get_param(conf, "ignore_databases")))
-    {
-        char val[strlen(param->value) + 1];
-        strcpy(val, param->value);
-
-        const char *sep = ", \t";
-        char *sptr;
-        char *tok = strtok_r(val, sep, &sptr);
-
-        while (tok)
-        {
-            m_ignored_dbs.insert(tok);
-            tok = strtok_r(NULL, sep, &sptr);
-        }
-    }
-
-    bool failure = false;
-
-    for (int i = 0; options && options[i]; i++)
-    {
-        char* value = strchr(options[i], '=');
-
-        if (value == NULL)
-        {
-            MXS_ERROR("Unknown router options for %s", options[i]);
-            failure = true;
-            break;
-        }
-
-        *value = '\0';
-        value++;
-
-        if (strcmp(options[i], "max_sescmd_history") == 0)
-        {
-            MXS_WARNING("Use of 'max_sescmd_history' is deprecated");
-        }
-        else if (strcmp(options[i], "disable_sescmd_history") == 0)
-        {
-            MXS_WARNING("Use of 'disable_sescmd_history' is deprecated");
-        }
-        else if (strcmp(options[i], "refresh_databases") == 0)
-        {
-            m_config.refresh_databases = config_truth_value(value);
-        }
-        else if (strcmp(options[i], "refresh_interval") == 0)
-        {
-            m_config.refresh_min_interval = atof(value);
-        }
-        else if (strcmp(options[i], "debug") == 0)
-        {
-            m_config.debug = config_truth_value(value);
-        }
-        else
-        {
-            MXS_ERROR("Unknown router options for %s", options[i]);
-            failure = true;
-            break;
-        }
-    }
-
-    if (failure)
-    {
-        throw std::runtime_error("Failed to create schemarouter instance.");
-    }
 }
 
 SchemaRouter::~SchemaRouter()
@@ -182,7 +68,111 @@ SchemaRouter::~SchemaRouter()
 
 SchemaRouter* SchemaRouter::create(SERVICE* pService, char** pzOptions)
 {
-    return new SchemaRouter(pService, pzOptions);
+    MXS_CONFIG_PARAMETER* conf = pService->svc_config_param;
+
+    if ((config_get_param(conf, "auth_all_servers")) == NULL)
+    {
+        MXS_NOTICE("Authentication data is fetched from all servers. To disable this "
+                   "add 'auth_all_servers=0' to the service.");
+        pService->users_from_all = true;
+    }
+
+    Config config;
+    MXS_CONFIG_PARAMETER* param;
+
+    config.refresh_databases = config_get_bool(conf, "refresh_databases");
+    config.refresh_min_interval = config_get_integer(conf, "refresh_interval");
+    config.debug = config_get_bool(conf, "debug");
+
+    if ((param = config_get_param(conf, "ignore_databases_regex")))
+    {
+        int errcode;
+        PCRE2_SIZE erroffset;
+        pcre2_code* re = pcre2_compile((PCRE2_SPTR)param->value, PCRE2_ZERO_TERMINATED, 0,
+                                       &errcode, &erroffset, NULL);
+
+        if (re == NULL)
+        {
+            PCRE2_UCHAR errbuf[512];
+            pcre2_get_error_message(errcode, errbuf, sizeof(errbuf));
+            MXS_ERROR("Regex compilation failed at %d for regex '%s': %s",
+                      (int)erroffset, param->value, errbuf);
+            return NULL;
+        }
+
+        pcre2_match_data* match_data = pcre2_match_data_create_from_pattern(re, NULL);
+
+        if (match_data == NULL)
+        {
+            pcre2_code_free(re);
+            return NULL;
+        }
+
+        config.ignore_regex = re;
+        config.ignore_match_data = match_data;
+    }
+
+    if ((param = config_get_param(conf, "ignore_databases")))
+    {
+        char val[strlen(param->value) + 1];
+        strcpy(val, param->value);
+
+        const char *sep = ", \t";
+        char *sptr;
+        char *tok = strtok_r(val, sep, &sptr);
+
+        while (tok)
+        {
+            config.ignored_dbs.insert(tok);
+            tok = strtok_r(NULL, sep, &sptr);
+        }
+    }
+
+    bool success = true;
+
+    for (int i = 0; pzOptions && pzOptions[i]; i++)
+    {
+        char* value = strchr(pzOptions[i], '=');
+
+        if (value == NULL)
+        {
+            MXS_ERROR("Unknown router options for %s", pzOptions[i]);
+            success = false;
+            break;
+        }
+
+        *value = '\0';
+        value++;
+
+        if (strcmp(pzOptions[i], "max_sescmd_history") == 0)
+        {
+            MXS_WARNING("Use of 'max_sescmd_history' is deprecated");
+        }
+        else if (strcmp(pzOptions[i], "disable_sescmd_history") == 0)
+        {
+            MXS_WARNING("Use of 'disable_sescmd_history' is deprecated");
+        }
+        else if (strcmp(pzOptions[i], "refresh_databases") == 0)
+        {
+            config.refresh_databases = config_truth_value(value);
+        }
+        else if (strcmp(pzOptions[i], "refresh_interval") == 0)
+        {
+            config.refresh_min_interval = atof(value);
+        }
+        else if (strcmp(pzOptions[i], "debug") == 0)
+        {
+            config.debug = config_truth_value(value);
+        }
+        else
+        {
+            MXS_ERROR("Unknown router options for %s", pzOptions[i]);
+            success = false;
+            break;
+        }
+    }
+
+    return success ? new SchemaRouter(pService, config) : NULL;
 }
 
 SchemaRouterSession* SchemaRouter::newSession(MXS_SESSION* pSession)
